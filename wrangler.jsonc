@@ -1,0 +1,54 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "bestreads-demo",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-03-10",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"vars": {
+		"GITHUB_CLIENT_ID": "<your-github-client-id>",
+		"GITHUB_CLIENT_SECRET": "<your-github-client-secret>",
+		"COOKIE_ENCRYPTION_KEY": "<your-32-byte-hex-key>"
+	},
+	"migrations": [
+		{
+			"new_sqlite_classes": [
+				"MyMCP",
+				"UserBookPreferences"
+			],
+			"tag": "v1"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"class_name": "MyMCP",
+				"name": "MCP_OBJECT"
+			},
+			{
+				"class_name": "UserBookPreferences",
+				"name": "USER_BOOK_PREFERENCES"
+			}
+		]
+	},
+	"kv_namespaces": [
+		{
+			"binding": "OAUTH_KV",
+			"id": "33f81878244f4a1d82ac9d1f4d564367"
+		}
+	],
+	"ai": {
+		"binding": "AI"
+	},
+	"observability": {
+		"enabled": true
+	},
+	"dev": {
+		"port": 8788
+	}
+}
