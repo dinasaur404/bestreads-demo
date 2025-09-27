@@ -13,6 +13,12 @@
         "module": "es2022",
         /* Specify how TypeScript looks up a file from a given module specifier. */
         "moduleResolution": "bundler",
+        "baseUrl": ".",
+        "paths": {
+            "agents/codemode/ai": [
+                "./src/agents-codemode-ai.ts"
+            ]
+        },
         /* Specify type package names to be included without being referenced in a source file. */
         "types": [
             "./worker-configuration.d.ts",
