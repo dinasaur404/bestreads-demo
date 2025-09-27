@@ -1,27 +1,28 @@
-import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import { McpAgent } from "agents/mcp";
+import { experimental_codemode as codemode, CodeModeProxy } from "agents/codemode/ai";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { GitHubHandler } from "./github-handler";
 import { DurableObject } from "cloudflare:workers";
 
+type WorkerFetcher = {
+  fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+};
+
 interface Env {
-  GITHUB_CLIENT_ID: string;
-  GITHUB_CLIENT_SECRET: string;
-  COOKIE_ENCRYPTION_KEY: string;
-  OAUTH_KV: KVNamespace;
   MCP_OBJECT: DurableObjectNamespace;
   USER_BOOK_PREFERENCES: DurableObjectNamespace;
   AI: any;
+  LOADER?: WorkerFetcher;
+  globalOutbound?: WorkerFetcher;
 }
 
 // User authentication context that will be passed to MCP agent
 export type Props = {
-  login: string;
-  name: string;
-  email: string;
-  accessToken: string;
-  githubId: string;
+  login?: string;
+  name?: string;
+  email?: string;
+  accessToken?: string;
+  githubId?: string;
 };
 
 // Book preferences state stored per user
@@ -44,7 +45,7 @@ interface BookPreferences {
 
 // Durable Object class for storing user book preferences
 export class UserBookPreferences extends DurableObject {
-  private preferences: BookPreferences | null = null;
+  private preferences: BookPreferences | undefined;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -77,6 +78,8 @@ export class UserBookPreferences extends DurableObject {
 
 export class MyMCP extends McpAgent<Env, never, Props> {
   private _server: McpServer | undefined;
+  private codemodeInitialization: Promise<{ prompt: string; tools: Record<string, unknown> }> | null = null;
+  private codemodePrompt: string = "";
 
   set server(server: McpServer) {
     this._server = server;
@@ -100,7 +103,7 @@ export class MyMCP extends McpAgent<Env, never, Props> {
   get userPreferences(): DurableObjectStub<UserBookPreferences> {
     const userId = this.props?.login || 'anonymous';
     const userPreferencesId = this.env.USER_BOOK_PREFERENCES.idFromName(userId);
-    return this.env.USER_BOOK_PREFERENCES.get(userPreferencesId);
+    return this.env.USER_BOOK_PREFERENCES.get(userPreferencesId) as DurableObjectStub<UserBookPreferences>;
   }
 
   private async getUserPreferences(): Promise<BookPreferences> {
@@ -148,7 +151,24 @@ export class MyMCP extends McpAgent<Env, never, Props> {
 
     // Register MCP tools
     await this.registerTools();
-    
+
+    this.codemodeInitialization = codemode({
+      prompt: "You are the BestReads MCP server. Use the registered tools to help readers curate their libraries and surface new recommendations.",
+      tools: {},
+      globalOutbound: this.env.globalOutbound ?? globalOutbound,
+      loader: this.env.LOADER,
+      proxy: CodeModeProxy({
+        props: {
+          binding: "Codemode",
+          name: "BestReadsMCP",
+          callback: "callTool",
+        },
+      }),
+    });
+
+    const { prompt: codemodePrompt } = await this.codemodeInitialization;
+    this.codemodePrompt = codemodePrompt;
+
     console.log(`BestReads MCP server ready with all tools initialized`);
   }
 
@@ -476,7 +496,10 @@ This will help me avoid recommending books by this author in the future.`,
         const preferences = await this.getUserPreferences();
         
         // Build contextual prompt for AI recommendations
-        let prompt = `Recommend 3 books for ${preferences.userName}. `;
+        const codemodePrompt = this.codemodePrompt
+          ? `${this.codemodePrompt}\n\n`
+          : "";
+        let prompt = `${codemodePrompt}Recommend 3 books for ${preferences.userName}. `;
         
         if (preferences.favoriteGenres.length > 0) {
           prompt += `They enjoy these genres: ${preferences.favoriteGenres.join(", ")}. `;
@@ -550,38 +573,71 @@ ${response.response}${contextText}`,
   }
 }
 
-// Using the correct OAuth Provider pattern based on the actual library API
-export default new OAuthProvider({
-  // Configure API routes for MCP - these will have OAuth protection
-  apiHandlers: {
-    '/mcp': MyMCP.serve('/mcp', {
-      binding: 'MCP_OBJECT',
-      corsOptions: {
-        origin: "*",
-        methods: "GET, POST, OPTIONS",
-        headers: "Content-Type, Authorization",
-        maxAge: 86400
-      }
-    }),
-    '/sse': MyMCP.serveSSE('/sse', {
-      binding: 'MCP_OBJECT', 
-      corsOptions: {
-        origin: "*",
-        methods: "GET, POST, OPTIONS",
-        headers: "Content-Type, Authorization, Cache-Control, Last-Event-ID",
-        maxAge: 86400
-      }
-    }),
+export const globalOutbound = {
+  fetch: async (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
+};
+
+export { CodeModeProxy };
+
+const mcpHandler = MyMCP.serve("/mcp", {
+  binding: "MCP_OBJECT",
+  corsOptions: {
+    origin: "*",
+    methods: "GET, POST, OPTIONS",
+    headers: "Content-Type",
+    maxAge: 86400,
   },
-  
-  // The default handler handles OAuth flow and other non-API requests
-  defaultHandler: GitHubHandler,
-  
-  // OAuth endpoint configuration
-  authorizeEndpoint: "/authorize",
-  tokenEndpoint: "/token", 
-  clientRegistrationEndpoint: "/register",
-  scopesSupported: ["read:user", "user:email"],
-  // Add access token TTL (optional)
-  accessTokenTTL: 3600, // 1 hour
 });
+
+const sseHandler = MyMCP.serveSSE("/sse", {
+  binding: "MCP_OBJECT",
+  corsOptions: {
+    origin: "*",
+    methods: "GET, POST, OPTIONS",
+    headers: "Content-Type, Cache-Control, Last-Event-ID",
+    maxAge: 86400,
+  },
+});
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname.startsWith("/mcp")) {
+      return mcpHandler.fetch(request, env, ctx);
+    }
+
+    if (url.pathname.startsWith("/sse")) {
+      return sseHandler.fetch(request, env, ctx);
+    }
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+
+    return new Response(
+      JSON.stringify({
+        name: "BestReads MCP Server",
+        message: "MCP endpoints available at /mcp and /sse.",
+        codemode: {
+          enabled: true,
+        },
+      }),
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        },
+      },
+    );
+  },
+};
